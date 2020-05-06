@@ -50,7 +50,7 @@ func (s *StepCreateSSMTunnel) Run(ctx context.Context, state multistep.StateBag)
 	}
 	s.instanceId = aws.StringValue(instance.InstanceId)
 
-	log.Printf("Starting PortForwarding session to instance %q on local port %q to remote port %q", s.instanceId, s.LocalPortNumber, s.RemotePortNumber)
+	log.Printf("Starting PortForwarding session to instance %q on local port %d to remote port %d", s.instanceId, s.LocalPortNumber, s.RemotePortNumber)
 	input := s.BuildTunnelInputForInstance(s.instanceId)
 	ssmconn := ssm.New(s.AWSSession)
 	var output *ssm.StartSessionOutput

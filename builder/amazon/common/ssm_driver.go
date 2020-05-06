@@ -1,12 +1,14 @@
 package common
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os/exec"
+	"strings"
 
 	"github.com/aws/aws-sdk-go/service/ssm"
 )
@@ -28,9 +30,6 @@ type SSMDriver struct {
 
 // StartSession starts an interactive Systems Manager session with a remote instance via the AWS session-manager-plugin
 func (sd *SSMDriver) StartSession(ctx context.Context) error {
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-
 	if sd.PluginName == "" {
 		sd.PluginName = sessionManagerPluginName
 	}
@@ -42,18 +41,51 @@ func (sd *SSMDriver) StartSession(ctx context.Context) error {
 	}
 
 	cmd := exec.CommandContext(ctx, sd.PluginName, args...)
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Start(); err != nil {
-		err = fmt.Errorf("error encountered when calling %s: %s\nStderr: %s", sd.PluginName, err, stderr.String())
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
 		return err
 	}
-	// TODO capture logging for testing
-	log.Println(stdout.String())
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
 
-	return nil
+	// Aggregate all output into one reader
+	combinedOut := io.MultiReader(stdout, stderr)
+
+	if err := cmd.Start(); err != nil {
+		err = fmt.Errorf("error encountered when calling %s: %s\n", sd.PluginName, err)
+		return err
+	}
+
+	output := bufio.NewScanner(combinedOut)
+	successLogLine := fmt.Sprintf("opened for sessionId %s", *sd.Session.SessionId)
+	for output.Scan() {
+		if output.Err() != nil && output.Err() != io.EOF {
+			break
+		}
+
+		out := output.Text()
+		if out != "" {
+			if strings.Contains(out, "panic") {
+				line := fmt.Sprintf("[%s stderr] %s\n", sd.PluginName, out)
+				log.Print(line)
+				return fmt.Errorf("exited with a non-zero status")
+			}
+
+			line := fmt.Sprintf("[%s] %s\n", sd.PluginName, out)
+			log.Print(line)
+
+			if strings.Contains(line, successLogLine) {
+				return nil
+			}
+		}
+	}
+
+	// if we get here then something expected happened with the logging.
+	return fmt.Errorf("unable to determine if a successful tunnel has been established; giving up")
 }
+
 func (sd *SSMDriver) Args() ([]string, error) {
 	if sd.Session == nil {
 		return nil, fmt.Errorf("an active Amazon SSM Session is required before trying to open a session tunnel")
@@ -71,6 +103,7 @@ func (sd *SSMDriver) Args() ([]string, error) {
 		return nil, fmt.Errorf("error encountered in reading session parameter details %s", err)
 	}
 
+	// Args must be in this order
 	args := []string{
 		string(sessionDetails),
 		sd.Region,
