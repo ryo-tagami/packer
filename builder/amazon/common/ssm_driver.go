@@ -1,16 +1,15 @@
 package common
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os/exec"
-	"strings"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ssm"
+	"github.com/mitchellh/iochan"
 )
 
 const sessionManagerPluginName string = "session-manager-plugin"
@@ -24,23 +23,24 @@ type SSMDriver struct {
 	Session         *ssm.StartSessionOutput
 	SessionParams   ssm.StartSessionInput
 	SessionEndpoint string
-	// Provided for testing purposes; if not specified it defaults to sessionManagerPluginName
-	PluginName string
+	PluginName      string
 }
 
 // StartSession starts an interactive Systems Manager session with a remote instance via the AWS session-manager-plugin
-func (sd *SSMDriver) StartSession(ctx context.Context) error {
-	if sd.PluginName == "" {
-		sd.PluginName = sessionManagerPluginName
+func (d *SSMDriver) StartSession(ctx context.Context) error {
+	if d.PluginName == "" {
+		d.PluginName = sessionManagerPluginName
 	}
 
-	args, err := sd.Args()
+	args, err := d.Args()
 	if err != nil {
 		err = fmt.Errorf("error encountered validating session details: %s", err)
 		return err
 	}
 
-	cmd := exec.CommandContext(ctx, sd.PluginName, args...)
+	cmd := exec.CommandContext(ctx, d.PluginName, args...)
+
+	// Let's build up our logging
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -50,55 +50,50 @@ func (sd *SSMDriver) StartSession(ctx context.Context) error {
 		return err
 	}
 
-	// Aggregate all output into one reader
-	combinedOut := io.MultiReader(stdout, stderr)
+	// Create the channels we'll use for data
+	stdoutCh := iochan.DelimReader(stdout, '\n')
+	stderrCh := iochan.DelimReader(stderr, '\n')
 
+	// Loop and get all our output
+	go func(ctx context.Context, prefix string) {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case output := <-stderrCh:
+				if output != "" {
+					log.Printf("[ERROR] %s: %s", prefix, output)
+				}
+			case output := <-stdoutCh:
+				if output != "" {
+					log.Printf("[DEBUG] %s: %s", prefix, output)
+				}
+			}
+		}
+	}(ctx, d.PluginName)
+
+	log.Printf("[DEBUG %s] opening session tunnel to instance %q for session %q", d.PluginName, aws.StringValue(d.SessionParams.Target), aws.StringValue(d.Session.SessionId))
 	if err := cmd.Start(); err != nil {
-		err = fmt.Errorf("error encountered when calling %s: %s\n", sd.PluginName, err)
+		err = fmt.Errorf("error encountered when calling %s: %s\n", d.PluginName, err)
 		return err
 	}
 
-	output := bufio.NewScanner(combinedOut)
-	successLogLine := fmt.Sprintf("opened for sessionId %s", *sd.Session.SessionId)
-	for output.Scan() {
-		if output.Err() != nil && output.Err() != io.EOF {
-			break
-		}
-
-		out := output.Text()
-		if out != "" {
-			if strings.Contains(out, "panic") {
-				line := fmt.Sprintf("[%s stderr] %s\n", sd.PluginName, out)
-				log.Print(line)
-				return fmt.Errorf("exited with a non-zero status")
-			}
-
-			line := fmt.Sprintf("[%s] %s\n", sd.PluginName, out)
-			log.Print(line)
-
-			if strings.Contains(line, successLogLine) {
-				return nil
-			}
-		}
-	}
-
-	// if we get here then something expected happened with the logging.
-	return fmt.Errorf("unable to determine if a successful tunnel has been established; giving up")
+	return nil
 }
 
-func (sd *SSMDriver) Args() ([]string, error) {
-	if sd.Session == nil {
+func (d *SSMDriver) Args() ([]string, error) {
+	if d.Session == nil {
 		return nil, fmt.Errorf("an active Amazon SSM Session is required before trying to open a session tunnel")
 	}
 
 	// AWS session-manager-plugin requires a valid session be passed in JSON.
-	sessionDetails, err := json.Marshal(sd.Session)
+	sessionDetails, err := json.Marshal(d.Session)
 	if err != nil {
 		return nil, fmt.Errorf("error encountered in reading session details %s", err)
 	}
 
 	// AWS session-manager-plugin requires the parameters used in the session to be passed in JSON as well.
-	sessionParameters, err := json.Marshal(sd.SessionParams)
+	sessionParameters, err := json.Marshal(d.SessionParams)
 	if err != nil {
 		return nil, fmt.Errorf("error encountered in reading session parameter details %s", err)
 	}
@@ -106,11 +101,11 @@ func (sd *SSMDriver) Args() ([]string, error) {
 	// Args must be in this order
 	args := []string{
 		string(sessionDetails),
-		sd.Region,
+		d.Region,
 		sessionCommand,
-		sd.ProfileName,
+		d.ProfileName,
 		string(sessionParameters),
-		sd.SessionEndpoint,
+		d.SessionEndpoint,
 	}
 
 	return args, nil
